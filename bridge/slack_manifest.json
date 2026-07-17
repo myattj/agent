@@ -1,0 +1,55 @@
+{
+  "_comment": "Template for a self-hosted Agent Slack app. Replace every https://agent.example.com value with the public HTTPS origin of your bridge before importing this manifest at api.slack.com. Keep oauth_config.scopes.bot in sync with bridge/bridge/slack_oauth.py::_SCOPES, and keep interactivity.request_url in sync with bridge/bridge/main.py::slack_interactions.",
+  "display_information": {
+    "name": "agent",
+    "description": "Internal-ops AI agent for alert triage, team Q&A, and workflow automation.",
+    "background_color": "#0b1021"
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "Agent",
+      "always_online": true
+    },
+    "assistant_view": {
+      "assistant_description": "Internal-ops AI agent for alert triage, team Q&A, and workflow automation.",
+      "suggested_prompts": []
+    }
+  },
+  "oauth_config": {
+    "redirect_urls": [
+      "https://agent.example.com/slack/oauth/callback"
+    ],
+    "scopes": {
+      "bot": [
+        "app_mentions:read",
+        "assistant:write",
+        "chat:write",
+        "channels:history",
+        "channels:read",
+        "groups:history",
+        "groups:read",
+        "im:history",
+        "mpim:history",
+        "users:read",
+        "team:read",
+        "reactions:read"
+      ]
+    }
+  },
+  "settings": {
+    "event_subscriptions": {
+      "request_url": "https://agent.example.com/slack/events",
+      "bot_events": [
+        "app_mention",
+        "reaction_added"
+      ]
+    },
+    "interactivity": {
+      "is_enabled": true,
+      "request_url": "https://agent.example.com/slack/interactions"
+    },
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": false,
+    "token_rotation_enabled": false
+  }
+}
