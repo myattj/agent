@@ -103,9 +103,13 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
+      # Scan every commit directly. The GitHub Action's push-range mode cannot
+      # address the nonexistent parent of a repository's first commit.
+      - name: Scan full Git history
+        run: >-
+          docker run --rm --volume "$GITHUB_WORKSPACE:/repo:ro"
+          ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+          git /repo --redact --no-banner --verbose
 
   tooling-tests:
     name: Local tooling and synthetic lab
@@ -251,7 +255,7 @@ jobs:
       # GatewayStack consumes this ignored build artifact. Build it from
       # source so synth also works in a clean checkout.
       - run: bash scripts/build_interceptor_zip.sh
-      # Dummy account and context — synth is purely local, with no AWS calls.
+      # Dummy account; cdk.json supplies deterministic AZs so synth stays offline.
       - run: npx cdk synth --quiet
         env:
           CDK_DEFAULT_ACCOUNT: "000000000000"
@@ -261,7 +265,15 @@ jobs:
           --context bridgePublicUrl=https://bridge.example.test
         env:
           CDK_DEFAULT_ACCOUNT: "000000000000"
-      - name: Synth services stack
+      - name: Synth certificate-free services stack
+        run: >-
+          npx cdk synth AgentCore-coreAgent-services-us-west-2 --quiet
+          --context agentRuntimeArn=arn:aws:bedrock-agentcore:us-west-2:000000000000:runtime/example
+          --context slackSecretsArn=arn:aws:secretsmanager:us-west-2:000000000000:secret:slack-abc123
+          --context bridgeSecretsArn=arn:aws:secretsmanager:us-west-2:000000000000:secret:bridge-abc123
+        env:
+          CDK_DEFAULT_ACCOUNT: "000000000000"
+      - name: Synth HTTPS services stack
         run: >-
           npx cdk synth AgentCore-coreAgent-services-us-west-2 --quiet
           --context agentRuntimeArn=arn:aws:bedrock-agentcore:us-west-2:000000000000:runtime/example
