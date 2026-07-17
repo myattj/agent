@@ -1,0 +1,135 @@
+{
+  "tenant_id": "demo",
+  "model_id": "global.anthropic.claude-sonnet-4-6",
+  "system_prompt": "You are the demo workspace assistant. Be concise and direct. When a user references 'this thread' or 'this conversation', call read_thread_context to fetch the full thread before responding. When searching for information, check all available documentation tools. When a user reports an issue, always check team history for similar known issues before investigating further. When asked to escalate, use the escalate tool with the appropriate team name.",
+  "catalog": {
+    "allowed_tools": [
+      "echo",
+      "start_background_task",
+      "search_team_history",
+      "read_thread_context",
+      "post_to_channel",
+      "escalate",
+      "render_dashboard"
+    ],
+    "tool_config": {}
+  },
+  "byo": {
+    "enabled": false,
+    "gateway_endpoint": null,
+    "gateway_auth": null,
+    "connected_integrations": []
+  },
+  "memory": {
+    "triggers": {
+      "message_count": 6,
+      "token_count": 1000,
+      "idle_timeout_seconds": 1800
+    },
+    "namespace": "tenants/demo",
+    "extraction": {
+      "enabled": true,
+      "rules": [
+        "user_preferences",
+        "facts"
+      ]
+    },
+    "shared_across_channels": false,
+    "isolated_channels": []
+  },
+  "heartbeat": {
+    "busy_threshold": 1,
+    "max_background_seconds": 3600
+  },
+  "cost_cap": {
+    "monthly_limit_dollars": 50.0,
+    "enabled": true
+  },
+  "channels": {
+    "C_ASK_DATA": {
+      "system_prompt": "You are a data team Q&A bot. Answer questions about data pipelines, schemas, and dashboards. Search team history and any connected documentation sources before answering.",
+      "allowed_tools": [
+        "search_team_history"
+      ],
+      "memory_rules": [
+        "faq_in_channel"
+      ]
+    },
+    "C_ASK_PLATFORM": {
+      "system_prompt": "You are a platform engineering Q&A bot. Answer questions about infrastructure, deployments, and internal tools. Search connected documentation sources when available and read threads for context.",
+      "allowed_tools": [
+        "search_team_history",
+        "read_thread_context"
+      ],
+      "memory_rules": [
+        "faq_in_channel"
+      ]
+    },
+    "C_WORKFLOWS": {
+      "system_prompt": "You are a workflow automation bot. When asked, read thread context and help create tickets or take actions based on the conversation.",
+      "allowed_tools": [
+        "read_thread_context",
+        "post_to_channel"
+      ],
+      "memory_rules": []
+    }
+  },
+  "admin_user_ids": [],
+  "bot_policy": {
+    "allow_all_bots": false,
+    "trusted_bot_ids": [],
+    "open_channels": []
+  },
+  "context_assembly": {
+    "resolve_permalinks": true,
+    "inject_thread_history": true,
+    "thread_history_depth": 25,
+    "max_permalinks": 3
+  },
+  "skills": [
+    {
+      "trigger": "(?i)\\b(schema|dbt|pipeline|warehouse)\\b",
+      "name": "data-qa",
+      "prompt_template": "The user is asking a data-platform question. Before answering, call search_team_history for prior answers. If your tools include search_docs, call it too (data namespace first); otherwise use any connected document-search tool by its advertised name. Cite your sources inline and prefer short, direct answers.",
+      "required_tools": [
+        "search_team_history"
+      ],
+      "channels": [
+        "C_ASK_DATA"
+      ]
+    },
+    {
+      "trigger": "/ticket",
+      "name": "draft-ticket",
+      "prompt_template": "The user wants a ticket drafted from the current thread. Call read_thread_context to pull the full conversation, then produce a structured summary with: title, problem statement, reproduction steps (if any), and affected surfaces. Do NOT post anywhere \u2014 just return the draft so the user can copy it.",
+      "required_tools": [
+        "read_thread_context"
+      ],
+      "channels": [
+        "C_WORKFLOWS"
+      ]
+    }
+  ],
+  "escalation": {
+    "routes": [
+      {
+        "team_name": "sre",
+        "channel_id": "C_SRE_ESCALATIONS",
+        "description": "Site Reliability Engineering \u2014 infrastructure, availability, incidents",
+        "contacts": []
+      },
+      {
+        "team_name": "data-eng",
+        "channel_id": "C_DATA_ESCALATIONS",
+        "description": "Data Engineering \u2014 pipelines, schemas, data quality",
+        "contacts": []
+      },
+      {
+        "team_name": "security",
+        "channel_id": "C_SECURITY",
+        "description": "Security \u2014 access control, vulnerabilities, compliance",
+        "contacts": []
+      }
+    ]
+  }
+}
