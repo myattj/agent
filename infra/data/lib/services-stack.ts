@@ -428,6 +428,7 @@ export class ServicesStack extends Stack {
       environment: {
         NODE_ENV: 'production',
         BRIDGE_URL: publicUrl,
+        ONBOARDING_PUBLIC_URL: publicUrl,
         // NEXT_PUBLIC_* is inlined at build time for the client bundle,
         // but lib/env.ts also validates it at runtime on the server.
         NEXT_PUBLIC_BRIDGE_INSTALL_URL: slackInstallUrl,

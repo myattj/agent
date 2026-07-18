@@ -1,7 +1,7 @@
 # Agent core runtime
 
-This package is the tenant-aware AI runtime behind the archived Agent
-reference implementation. It runs a Strands agent on Amazon Bedrock AgentCore,
+This package is the tenant-aware AI runtime behind the self-hosted Agent
+project. It runs a Strands agent on Amazon Bedrock AgentCore,
 streams its response back to the transport bridge, and keeps model behavior,
 tool execution, memory, audit, metrics, and heartbeat state inside the agent
 boundary.
@@ -105,6 +105,7 @@ tokens, private keys, resource-specific ARNs, or deployed AgentCore state.
 ## Deployment note
 
 Edit `coreAgent/agentcore/agentcore.json`, not the generated CDK under
-`coreAgent/agentcore/cdk/`. Validate from `coreAgent/` with
-`agentcore validate`; review IAM, memory IDs, Gateway endpoints, model access,
-and cost controls before running `agentcore deploy`.
+`coreAgent/agentcore/cdk/`. From the repository root, run `make aws-configure`
+and `make agent-deploy`; the wrapper validates and deploys with the selected
+region, then restores the tracked manifest. Review IAM, memory IDs, Gateway
+endpoints, model access, and cost controls before deploying.

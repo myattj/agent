@@ -6,16 +6,23 @@ import { verifyOpsSession } from "@/lib/ops";
 
 const ADMIN_SECRET = "operator-secret-that-is-long-and-random";
 
-function loginRequest(secret: string): NextRequest {
+function loginRequest(
+  secret: string,
+  headers: Record<string, string> = {},
+): NextRequest {
   return new NextRequest("https://agent.test/ops/login/submit", {
     method: "POST",
     body: new URLSearchParams({ secret }),
-    headers: { "content-type": "application/x-www-form-urlencoded" },
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      ...headers,
+    },
   });
 }
 
 beforeEach(() => {
   vi.stubEnv("ADMIN_SECRET", ADMIN_SECRET);
+  vi.stubEnv("ONBOARDING_PUBLIC_URL", "https://agent.test");
 });
 
 afterEach(() => {
@@ -53,5 +60,17 @@ describe("operator login", () => {
 
     expect(response.headers.get("location")).toBe("https://agent.test/ops/login?e=1");
     expect(response.cookies.get("ops_session")).toBeUndefined();
+  });
+
+  it("ignores hostile forwarded hosts when redirecting", async () => {
+    const response = await POST(
+      loginRequest(ADMIN_SECRET, {
+        host: "evil.example",
+        "x-forwarded-host": "evil.example",
+        "x-forwarded-proto": "http",
+      }),
+    );
+
+    expect(response.headers.get("location")).toBe("https://agent.test/ops");
   });
 });

@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 from bridge.api_models import MemoryConfigPatch
 from bridge.main import app
 from bridge.slack_oauth import make_session_token
+from bridge.tenant_write import TenantConfigConflictError
 
 
 @pytest.fixture
@@ -75,9 +76,16 @@ def stub_store(monkeypatch: pytest.MonkeyPatch) -> dict[str, dict[str, Any]]:
 
         return copy.deepcopy(store[tenant_id])
 
-    def fake_update(tenant_id: str, _region: str, full: dict[str, Any]) -> None:
+    def fake_update(
+        tenant_id: str,
+        _region: str,
+        full: dict[str, Any],
+        expected_config: dict[str, Any] | None = None,
+    ) -> None:
         if tenant_id not in store:
             raise KeyError(tenant_id)
+        if expected_config is not None and store[tenant_id] != expected_config:
+            raise TenantConfigConflictError(tenant_id)
         store[tenant_id] = full
 
     monkeypatch.setattr("bridge.api.get_tenant_row", fake_get)
@@ -243,6 +251,80 @@ def test_patch_response_redacts_but_preserves_operator_fields(
     assert stub_store["slack-alpha"]["byo"]["gateway_auth"] == {
         "headers": {"X-Secret": "secret-sentinel"}
     }
+
+
+def test_patch_retries_without_reverting_concurrent_operator_update(
+    client: TestClient,
+    stub_store: dict[str, dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def conflicting_update(
+        tenant_id: str,
+        _region: str,
+        full: dict[str, Any],
+        expected_config: dict[str, Any] | None = None,
+    ) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            stub_store[tenant_id]["admin_user_ids"] = ["U_OPERATOR"]
+        if expected_config is not None and stub_store[tenant_id] != expected_config:
+            raise TenantConfigConflictError(tenant_id)
+        stub_store[tenant_id] = full
+
+    monkeypatch.setattr("bridge.api.update_tenant_row", conflicting_update)
+    token = make_session_token("slack-alpha")
+
+    response = client.patch(
+        "/api/tenants/slack-alpha",
+        headers=_auth(token),
+        json={"system_prompt": "Updated without clobbering operators."},
+    )
+
+    assert response.status_code == 200, response.text
+    assert calls == 2
+    assert stub_store["slack-alpha"]["admin_user_ids"] == ["U_OPERATOR"]
+    assert (
+        stub_store["slack-alpha"]["system_prompt"]
+        == "Updated without clobbering operators."
+    )
+
+
+def test_patch_returns_conflict_after_bounded_retries(
+    client: TestClient,
+    stub_store: dict[str, dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def always_conflicts(
+        _tenant_id: str,
+        _region: str,
+        _full: dict[str, Any],
+        expected_config: dict[str, Any] | None = None,
+    ) -> None:
+        nonlocal calls
+        calls += 1
+        assert expected_config is not None
+        raise TenantConfigConflictError("changed")
+
+    monkeypatch.setattr("bridge.api.update_tenant_row", always_conflicts)
+    token = make_session_token("slack-alpha")
+
+    response = client.patch(
+        "/api/tenants/slack-alpha",
+        headers=_auth(token),
+        json={"system_prompt": "Never persisted."},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "tenant configuration changed; retry request"
+    }
+    assert calls == 3
+    assert stub_store["slack-alpha"]["system_prompt"] == "You are Alpha's helper."
 
 
 def test_patch_allowed_tools_preserves_tool_config(

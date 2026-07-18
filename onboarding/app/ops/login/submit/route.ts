@@ -16,7 +16,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { NextResponse, type NextRequest } from "next/server";
 
-import { getAdminSecret } from "@/lib/env";
+import { getAdminSecret, getOnboardingPublicOrigin } from "@/lib/env";
 import {
   makeOpsSession,
   OPS_COOKIE_NAME,
@@ -37,16 +37,16 @@ export async function POST(request: NextRequest) {
   // helpful error state by returning a redirect to the page with the
   // error marker. Could also 503 but that's less user-friendly.
   if (!expected) {
-    return redirectTo(request, "/ops/login?e=1");
+    return redirectTo("/ops/login?e=1");
   }
 
   const form = await request.formData();
   const submitted = form.get("secret");
   if (typeof submitted !== "string" || !secretsEqual(submitted, expected)) {
-    return redirectTo(request, "/ops/login?e=1");
+    return redirectTo("/ops/login?e=1");
   }
 
-  const response = redirectTo(request, "/ops");
+  const response = redirectTo("/ops");
   response.cookies.set({
     name: OPS_COOKIE_NAME,
     value: makeOpsSession(expected),
@@ -55,11 +55,9 @@ export async function POST(request: NextRequest) {
   return response;
 }
 
-/** Compose an absolute URL from the ALB-forwarded host headers. */
-function redirectTo(request: NextRequest, path: string): NextResponse {
-  const proto = request.headers.get("x-forwarded-proto") ?? "https";
-  const host =
-    request.headers.get("x-forwarded-host") ?? request.headers.get("host") ?? "";
-  const origin = host ? `${proto}://${host}` : request.url;
-  return NextResponse.redirect(new URL(path, origin), { status: 302 });
+/** Redirect only through the configured public origin, never request headers. */
+function redirectTo(path: string): NextResponse {
+  return NextResponse.redirect(new URL(path, getOnboardingPublicOrigin()), {
+    status: 302,
+  });
 }
