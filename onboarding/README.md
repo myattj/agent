@@ -1,7 +1,7 @@
 # Onboarding and operations UI
 
 This Next.js application provides the human-facing setup and operations surfaces
-for the archived AgentCore reference project. It talks to the bridge API and
+for the self-hosted AgentCore project. It talks to the bridge API and
 does not access DynamoDB or the agent runtime directly.
 
 See the [root README](../README.md) for project status and the end-to-end local
@@ -49,6 +49,7 @@ The tracked [.env.example](.env.example) documents the intended local values:
 | Variable | Purpose |
 |---|---|
 | <code>BRIDGE_URL</code> | Server-side bridge API base URL |
+| <code>ONBOARDING_PUBLIC_URL</code> | Canonical browser origin for safe server-side redirects |
 | <code>BRIDGE_OAUTH_STATE_SECRET</code> | HMAC secret for bridge-minted onboarding sessions |
 | <code>NEXT_PUBLIC_BRIDGE_INSTALL_URL</code> | Public Slack install URL rendered by the browser |
 | <code>ADMIN_SECRET</code> | Optional operator login secret |
@@ -102,20 +103,21 @@ BRIDGE_OAUTH_STATE_SECRET=$(openssl rand -hex 32) npm test
 NEXT_PUBLIC_BRIDGE_INSTALL_URL=https://ci.test/slack/install npm run build
 ~~~
 
-## Reference deployment
+## Manual deployment
 
 The optional Services CDK stack builds and runs this app as an ECS Fargate
 service behind an Application Load Balancer. It is enabled only when the
 required runtime and secret contexts are supplied. See
 [infra/data/README.md](../infra/data/README.md).
 
-Keep the reference stack's shared public-origin routing for the bridge and this
+Keep the supported stack's shared public-origin routing for the bridge and this
 UI. A split-host deployment needs a separately reviewed one-time code exchange
 or explicit cookie-domain design; never pass the onboarding session in a URL.
 
-The production GitHub Actions workflow is manual-only and requires explicit
-confirmation. Configure real domains, TLS certificates, secrets, IAM policies,
-and budget controls before deploying.
+The production GitHub Actions workflow is manual-only, requires explicit
+confirmation, and refuses to deploy without a domain and TLS certificate.
+Configure secrets, least-privilege IAM policies, and budget controls before
+deploying.
 
 ## Layout
 

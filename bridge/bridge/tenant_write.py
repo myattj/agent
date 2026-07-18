@@ -29,18 +29,16 @@ Public API:
     create of a `workspace_to_tenant` row with the same semantics.
   - `get_tenant_row(tenant_id, region) -> dict` — returns the `config`
     sub-dict. Raises `KeyError` for unknown tenants.
-  - `update_tenant_row(tenant_id, region, full_config_dict)` — blob
-    overwrite of the `config` attribute with a `ConditionExpression` that
-    refuses to create (PATCH must not create — only OAuth can). Uses the
-    same UpdateExpression as the default-row upsert.
+  - `update_tenant_row(tenant_id, region, full_config_dict, expected_config)`
+    — blob overwrite of the `config` attribute with a condition that refuses
+    to create and, when supplied, rejects stale read-modify-write cycles.
   - `deep_merge(base, patch)` — first-level deep merge helper for PATCH
     semantics. Used by the `/api/tenants/{id}` PATCH route.
 
-Concurrency: DynamoDB `update_item` is strongly consistent for the same
-partition key, so a GET-modify-PUT cycle sees its own write on read-back.
-There is no optimistic-concurrency guard (the current UI assumes a single
-administrator per tenant). Add an `updated_at` conditional expression if a
-multi-user admin UI is introduced.
+Concurrency: tenant-session PATCH passes the config it read as
+`expected_config`. DynamoDB compares that map in the write condition, so a
+concurrent operator update cannot be replaced by a stale full-blob write. The
+route re-reads and retries a bounded number of times.
 """
 from __future__ import annotations
 
@@ -62,7 +60,12 @@ class GitHubInstallationBindingConflict(RuntimeError):
     """An installation is already bound, or a tenant already has another."""
 
 
+class TenantConfigConflictError(RuntimeError):
+    """The tenant config changed after a caller read it."""
+
+
 _local_github_binding_lock = threading.Lock()
+_local_config_update_lock = threading.Lock()
 
 
 def _floats_to_decimals(obj: Any) -> Any:
@@ -331,13 +334,39 @@ def _local_upsert_default(tenant_id: str) -> None:
     path.write_text(json.dumps(build_default_config_dict(tenant_id), indent=2) + "\n")
 
 
-def _local_update(tenant_id: str, full_config: dict[str, Any]) -> None:
-    """Full-blob write. Raises KeyError if the file doesn't exist
-    (matches DDB's ConditionExpression="attribute_exists(tenant_id)")."""
+def _local_update(
+    tenant_id: str,
+    full_config: dict[str, Any],
+    expected_config: dict[str, Any] | None = None,
+) -> None:
+    """Atomically replace a local config, optionally rejecting a stale read."""
     path = _local_tenant_path(tenant_id)
-    if not path.exists():
-        raise KeyError(f"No tenant config at {path}")
-    path.write_text(json.dumps(full_config, indent=2) + "\n")
+    with _local_config_update_lock:
+        if not path.exists():
+            raise KeyError(f"No tenant config at {path}")
+        if expected_config is not None and json.loads(path.read_text()) != expected_config:
+            raise TenantConfigConflictError(
+                f"Tenant config changed for tenant_id={tenant_id!r}"
+            )
+
+        temporary_name: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temporary:
+                temporary.write(json.dumps(full_config, indent=2) + "\n")
+                temporary.flush()
+                os.fsync(temporary.fileno())
+                temporary_name = temporary.name
+            os.replace(temporary_name, path)
+        finally:
+            if temporary_name and os.path.exists(temporary_name):
+                os.unlink(temporary_name)
 
 
 def _local_upsert_workspace_mapping(workspace_id: str, tenant_id: str) -> None:
@@ -472,39 +501,54 @@ def update_tenant_row(
     tenant_id: str,
     region: str,
     full_config: dict[str, Any],
+    expected_config: dict[str, Any] | None = None,
 ) -> None:
     """Overwrite the tenant's `config` attribute with the given dict.
 
-    Uses `ConditionExpression="attribute_exists(tenant_id)"` so PATCH
-    refuses to create — only the OAuth callback is allowed to bring a
-    tenant into existence. Refreshes `updated_at`.
+    Always refuses to create. When `expected_config` is supplied, the write
+    also requires the stored map to equal the caller's prior read. This keeps
+    stale tenant-session writes from reverting concurrent operator changes.
+    Refreshes `updated_at`.
 
-    Raises `KeyError` if the row doesn't exist (translated from
-    `ConditionalCheckFailedException`).
+    Raises `KeyError` if the row doesn't exist and `TenantConfigConflictError`
+    if an optimistic-concurrency comparison fails.
     """
     if _is_local_dev():
-        _local_update(tenant_id, full_config)
+        _local_update(tenant_id, full_config, expected_config)
         return
 
     from botocore.exceptions import ClientError
 
     table = _get_table(region, _tenants_table_name())
     now = _iso_now()
+    condition = "attribute_exists(tenant_id)"
+    expression_values = {
+        ":config": _floats_to_decimals(full_config),
+        ":now": now,
+    }
+    if expected_config is not None:
+        condition += " AND #config = :expected_config"
+        expression_values[":expected_config"] = _floats_to_decimals(expected_config)
     try:
         table.update_item(
             Key={"tenant_id": tenant_id},
             UpdateExpression="SET #config = :config, updated_at = :now",
-            ConditionExpression="attribute_exists(tenant_id)",
+            ConditionExpression=condition,
             ExpressionAttributeNames={"#config": "config"},
-            ExpressionAttributeValues={
-                ":config": _floats_to_decimals(full_config),
-                ":now": now,
-            },
+            ExpressionAttributeValues=expression_values,
         )
     except ClientError as e:
         code = e.response.get("Error", {}).get("Code")
         if code == "ConditionalCheckFailedException":
-            raise KeyError(f"No tenant row for tenant_id={tenant_id!r}") from e
+            existing = table.get_item(
+                Key={"tenant_id": tenant_id},
+                ConsistentRead=True,
+            ).get("Item")
+            if not existing:
+                raise KeyError(f"No tenant row for tenant_id={tenant_id!r}") from e
+            raise TenantConfigConflictError(
+                f"Tenant config changed for tenant_id={tenant_id!r}"
+            ) from e
         raise
 
 

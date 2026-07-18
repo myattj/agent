@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -31,6 +32,62 @@ import httpx
 from .gateway_jwt import mint_token
 
 log = logging.getLogger(__name__)
+
+_ACCOUNT_RE = re.compile(r"^[0-9]{12}$")
+_REGION_RE = re.compile(r"^[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+$")
+_GOVCLOUD_REGION_RE = re.compile(r"^us-gov-(?:east|west)-[0-9]+$")
+_COMMERCIAL_REGION_RE = re.compile(
+    r"^(?:af-south|ap-(?:east|northeast|south|southeast)|"
+    r"ca-(?:central|west)|eu-(?:central|north|south|west)|il-central|"
+    r"me-(?:central|south)|mx-central|sa-east|us-(?:east|west))-[0-9]+$"
+)
+_RUNTIME_RESOURCE_RE = re.compile(
+    r"^(?:"
+    r"agent/[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-"
+    r"[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}:[1-9][0-9]{0,4}"
+    r"|runtime/[A-Za-z][A-Za-z0-9_]{0,99}-[A-Za-z0-9]{10}"
+    r")$"
+)
+
+
+def _expected_partition(region: str) -> str:
+    if _GOVCLOUD_REGION_RE.fullmatch(region):
+        return "aws-us-gov"
+    if region.startswith("cn-"):
+        raise RuntimeError(
+            "AWS China is not a supported AgentCore Runtime target for this "
+            "reference deployment."
+        )
+    if _COMMERCIAL_REGION_RE.fullmatch(region):
+        return "aws"
+    raise RuntimeError(
+        f"AWS region {region!r} is outside the supported commercial and "
+        "GovCloud partitions."
+    )
+
+
+def _runtime_region(runtime_arn: str) -> str:
+    """Extract and validate the region from an AgentCore Runtime ARN."""
+    parts = runtime_arn.split(":", 5)
+    if (
+        len(parts) != 6
+        or parts[0] != "arn"
+        or parts[1] not in {"aws", "aws-us-gov"}
+        or parts[2] != "bedrock-agentcore"
+        or not _REGION_RE.fullmatch(parts[3])
+        or not _ACCOUNT_RE.fullmatch(parts[4])
+        or not _RUNTIME_RESOURCE_RE.fullmatch(parts[5])
+    ):
+        raise RuntimeError(
+            "AGENT_RUNTIME_ARN must be a regional AgentCore Runtime ARN with "
+            "a documented agent/<uuid>:<version> or runtime/<id> resource."
+        )
+    if parts[1] != _expected_partition(parts[3]):
+        raise RuntimeError(
+            f"AGENT_RUNTIME_ARN partition {parts[1]!r} does not match "
+            f"region {parts[3]!r}."
+        )
+    return parts[3]
 
 
 def _parse_sse_frame(line: str) -> str | None:
@@ -93,17 +150,37 @@ class AgentCoreClient:
         self,
         runtime_arn: str | None = None,
         local_agent_url: str | None = None,
-        region: str = "us-west-2",
+        region: str | None = None,
     ) -> None:
         self.runtime_arn = runtime_arn or os.getenv("AGENT_RUNTIME_ARN")
         self.local_agent_url = local_agent_url or os.getenv("LOCAL_AGENT_URL")
-        self.region = region
 
         if not self.runtime_arn and not self.local_agent_url:
             raise RuntimeError(
                 "AgentCoreClient needs either AGENT_RUNTIME_ARN (production) "
                 "or LOCAL_AGENT_URL (local dev) — neither is set."
             )
+
+        # Local HTTP mode bypasses AWS entirely. Do not require or validate an
+        # AWS region just because the developer's shell happens to define one.
+        self.region: str | None = None
+        if self.local_agent_url:
+            return
+
+        assert self.runtime_arn is not None
+        runtime_region = _runtime_region(self.runtime_arn)
+        configured_region = (
+            region
+            or os.getenv("AWS_REGION")
+            or os.getenv("AWS_DEFAULT_REGION")
+        )
+        if configured_region and configured_region != runtime_region:
+            raise RuntimeError(
+                f"Configured AWS region {configured_region!r} does not match "
+                f"AGENT_RUNTIME_ARN region {runtime_region!r}. Configure the "
+                "bridge and AgentCore Runtime for the same region."
+            )
+        self.region = runtime_region
 
     def _prepare_payload(
         self,

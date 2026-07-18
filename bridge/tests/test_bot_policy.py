@@ -267,9 +267,16 @@ class TestPatchNewFields:
                 raise KeyError(tenant_id)
             return copy.deepcopy(store[tenant_id])
 
-        def fake_update(tenant_id: str, _region: str, full: dict[str, Any]) -> None:
+        def fake_update(
+            tenant_id: str,
+            _region: str,
+            full: dict[str, Any],
+            expected_config: dict[str, Any] | None = None,
+        ) -> None:
             if tenant_id not in store:
                 raise KeyError(tenant_id)
+            if expected_config is not None:
+                assert store[tenant_id] == expected_config
             store[tenant_id] = full
 
         monkeypatch.setattr("bridge.api.get_tenant_row", fake_get)

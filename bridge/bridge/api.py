@@ -57,11 +57,18 @@ from .api_models import (
 )
 from .slack_channels import list_channels_for_tenant
 from .slack_oauth import verify_session_token
-from .tenant_write import deep_merge, get_tenant_row, update_tenant_row
+from .tenant_write import (
+    TenantConfigConflictError,
+    deep_merge,
+    get_tenant_row,
+    update_tenant_row,
+)
 
 log = logging.getLogger(__name__)
 
 api_router = APIRouter(prefix="/api", tags=["api"])
+
+_PATCH_WRITE_ATTEMPTS = 3
 
 
 def _region() -> str:
@@ -160,35 +167,49 @@ async def patch_tenant(
     Refuses to create a tenant row that doesn't exist (404). Only the
     OAuth callback can bring a tenant into existence.
     """
-    try:
-        current = get_tenant_row(tenant_id, _region())
-    except KeyError:
-        raise HTTPException(status_code=404, detail="tenant not found")
-
     patch_dict = patch.model_dump(exclude_unset=True, exclude_none=False)
-    merged = deep_merge(current, patch_dict)
-    # Re-validate the merged result so any invalid combinations surface
-    # as 422. This also defaults in any fields the old row was missing.
-    try:
-        validated = TenantConfigOut.model_validate(merged)
-    except ValidationError:
-        # Never reflect Pydantic's ``input`` values: ``merged`` includes the
-        # tenant's stored configuration and may contain credentials.
-        log.info("patch_tenant: rejected invalid merged config tenant=%s", tenant_id)
-        raise HTTPException(
-            status_code=422,
-            detail="invalid tenant configuration",
-        ) from None
-    # The canonical dump goes back to DDB.
-    try:
-        update_tenant_row(tenant_id, _region(), validated.model_dump())
-    except KeyError:
-        # Race condition — tenant disappeared between GET and UPDATE.
-        # Vanishingly unlikely but surface as 404 rather than 500.
-        raise HTTPException(status_code=404, detail="tenant not found")
-    return TenantConfigOut.model_validate(
-        _tenant_session_view(validated.model_dump())
-    )
+    region = _region()
+    for attempt in range(_PATCH_WRITE_ATTEMPTS):
+        try:
+            current = get_tenant_row(tenant_id, region)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="tenant not found")
+
+        merged = deep_merge(current, patch_dict)
+        # Re-validate the merged result so any invalid combinations surface
+        # as 422. This also defaults in any fields the old row was missing.
+        try:
+            validated = TenantConfigOut.model_validate(merged)
+        except ValidationError:
+            # Never reflect Pydantic's ``input`` values: ``merged`` includes the
+            # tenant's stored configuration and may contain credentials.
+            log.info("patch_tenant: rejected invalid merged config tenant=%s", tenant_id)
+            raise HTTPException(
+                status_code=422,
+                detail="invalid tenant configuration",
+            ) from None
+
+        canonical = validated.model_dump()
+        try:
+            update_tenant_row(
+                tenant_id,
+                region,
+                canonical,
+                expected_config=current,
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail="tenant not found")
+        except TenantConfigConflictError:
+            if attempt + 1 == _PATCH_WRITE_ATTEMPTS:
+                raise HTTPException(
+                    status_code=409,
+                    detail="tenant configuration changed; retry request",
+                ) from None
+            continue
+
+        return TenantConfigOut.model_validate(_tenant_session_view(canonical))
+
+    raise AssertionError("unreachable")
 
 
 @api_router.get("/tenants/{tenant_id}/channels", response_model=ChannelsResponse)
