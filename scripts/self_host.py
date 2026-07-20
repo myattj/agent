@@ -7,7 +7,7 @@ developers authenticate through the normal AWS CLI/SDK credential chain.
 
 The default path deploys the supported core product:
 
-    data + alarms -> AgentCore runtime -> bridge/onboarding -> shared Gateway
+    data + alarms -> AgentCore runtime -> bridge/onboarding -> DNS/health -> shared Gateway
 
 The experimental PR sandbox remains disabled. AgentCore Memory is optional and
 is not required for the first Slack response.
@@ -47,6 +47,17 @@ SLACK_SECRET_NAME = "agentcore/services/slack"
 BRIDGE_SECRET_NAME = "agentcore/services/bridge"
 STATE_DIR = ROOT / ".self-host"
 GENERATED_MANIFEST = STATE_DIR / "slack_manifest.json"
+RUNTIME_NAME = "coreAgent_coreAgent"
+PRESERVED_RUNTIME_ENVIRONMENT = (
+    "GITHUB_APP_ID",
+    "AGENTCORE_MEMORY_ID",
+    "AGENTCORE_SEMANTIC_STRATEGY_ID",
+    "AGENTCORE_USER_PREF_STRATEGY_ID",
+)
+ECS_CLUSTER_NAME = "agentcore-services"
+ONBOARDING_SERVICE_NAME = "agentcore-onboarding"
+ONBOARDING_CONTAINER_NAME = "onboarding"
+PRESERVED_ONBOARDING_ENVIRONMENT = ("GITHUB_APP_SLUG",)
 
 _DOMAIN_RE = re.compile(
     r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
@@ -525,6 +536,221 @@ def _stack_outputs(
         ) from exc
 
 
+def _existing_runtime_environment(
+    runner: CommandRunner, config: DeploymentConfig
+) -> dict[str, str]:
+    """Read installer-managed optional values from an existing Runtime.
+
+    A second installer pass is required after DNS is live. Preserve optional
+    GitHub and Memory configuration that may already be attached to the
+    Runtime instead of silently removing it during that pass. Explicit process
+    environment variables still win, including an explicitly empty value.
+    """
+    listed = runner.run(
+        _aws_command(
+            config,
+            "bedrock-agentcore-control",
+            "list-agent-runtimes",
+            "--output",
+            "json",
+            "--no-cli-pager",
+        ),
+        capture=True,
+        quiet=True,
+    )
+    try:
+        payload = json.loads(listed.stdout)
+        if not isinstance(payload, dict) or not isinstance(
+            payload.get("agentRuntimes"), list
+        ):
+            raise TypeError
+        rows = [
+            row
+            for row in payload["agentRuntimes"]
+            if isinstance(row, dict) and row.get("agentRuntimeName") == RUNTIME_NAME
+        ]
+    except (AttributeError, TypeError, json.JSONDecodeError) as exc:
+        raise SelfHostError("AgentCore returned an invalid Runtime list") from exc
+    if not rows:
+        return {}
+    if len(rows) != 1:
+        raise SelfHostError(
+            f"expected at most one existing AgentCore Runtime named {RUNTIME_NAME}; "
+            f"found {len(rows)}"
+        )
+
+    runtime_id = rows[0].get("agentRuntimeId")
+    runtime_version = str(rows[0].get("agentRuntimeVersion") or "")
+    if not isinstance(runtime_id, str) or not runtime_id or not runtime_version:
+        raise SelfHostError("existing AgentCore Runtime has an invalid ID or version")
+    fetched = runner.run(
+        _aws_command(
+            config,
+            "bedrock-agentcore-control",
+            "get-agent-runtime",
+            "--agent-runtime-id",
+            runtime_id,
+            "--agent-runtime-version",
+            runtime_version,
+            "--output",
+            "json",
+            "--no-cli-pager",
+        ),
+        capture=True,
+        quiet=True,
+    )
+    try:
+        runtime = json.loads(fetched.stdout)
+        environment = runtime.get("environmentVariables") or {}
+    except (AttributeError, TypeError, json.JSONDecodeError) as exc:
+        raise SelfHostError("AgentCore returned invalid Runtime details") from exc
+    if (
+        runtime.get("agentRuntimeName") != RUNTIME_NAME
+        or runtime.get("agentRuntimeId") != runtime_id
+        or str(runtime.get("agentRuntimeVersion") or "") != runtime_version
+        or not isinstance(environment, dict)
+        or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in environment.items()
+        )
+    ):
+        raise SelfHostError("existing AgentCore Runtime failed identity validation")
+    return {
+        name: environment[name]
+        for name in PRESERVED_RUNTIME_ENVIRONMENT
+        if name in environment
+    }
+
+
+def _preserved_environment_value(name: str, existing: Mapping[str, str]) -> str:
+    """Use an explicit operator value, otherwise preserve the deployed value."""
+    if name in os.environ:
+        return os.environ[name]
+    return existing.get(name, "")
+
+
+def _existing_onboarding_environment(
+    runner: CommandRunner, config: DeploymentConfig
+) -> dict[str, str]:
+    """Read installer-managed UI values from the deployed onboarding task."""
+    listed = runner.run(
+        _aws_command(
+            config,
+            "ecs",
+            "list-clusters",
+            "--output",
+            "json",
+            "--no-cli-pager",
+        ),
+        capture=True,
+        quiet=True,
+    )
+    try:
+        payload = json.loads(listed.stdout)
+        cluster_arns = payload.get("clusterArns")
+        if not isinstance(cluster_arns, list) or any(
+            not isinstance(arn, str) for arn in cluster_arns
+        ):
+            raise TypeError
+    except (AttributeError, TypeError, json.JSONDecodeError) as exc:
+        raise SelfHostError("ECS returned an invalid cluster list") from exc
+    matching_clusters = [
+        arn for arn in cluster_arns if arn.rsplit("/", 1)[-1] == ECS_CLUSTER_NAME
+    ]
+    if not matching_clusters:
+        return {}
+    if len(matching_clusters) != 1:
+        raise SelfHostError(
+            f"expected at most one ECS cluster named {ECS_CLUSTER_NAME}; "
+            f"found {len(matching_clusters)}"
+        )
+    cluster_arn = matching_clusters[0]
+
+    described = runner.run(
+        _aws_command(
+            config,
+            "ecs",
+            "describe-services",
+            "--cluster",
+            cluster_arn,
+            "--services",
+            ONBOARDING_SERVICE_NAME,
+            "--output",
+            "json",
+            "--no-cli-pager",
+        ),
+        capture=True,
+        quiet=True,
+    )
+    try:
+        payload = json.loads(described.stdout)
+        services = payload.get("services")
+        failures = payload.get("failures") or []
+        if not isinstance(services, list) or not isinstance(failures, list):
+            raise TypeError
+    except (AttributeError, TypeError, json.JSONDecodeError) as exc:
+        raise SelfHostError("ECS returned invalid onboarding service details") from exc
+    if not services and all(
+        isinstance(failure, dict) and failure.get("reason") == "MISSING"
+        for failure in failures
+    ):
+        return {}
+    if failures or len(services) != 1 or not isinstance(services[0], dict):
+        raise SelfHostError("existing ECS onboarding service failed validation")
+    task_definition_arn = services[0].get("taskDefinition")
+    if not isinstance(task_definition_arn, str) or not task_definition_arn:
+        raise SelfHostError("existing ECS onboarding service has no task definition")
+
+    task_result = runner.run(
+        _aws_command(
+            config,
+            "ecs",
+            "describe-task-definition",
+            "--task-definition",
+            task_definition_arn,
+            "--output",
+            "json",
+            "--no-cli-pager",
+        ),
+        capture=True,
+        quiet=True,
+    )
+    try:
+        payload = json.loads(task_result.stdout)
+        task_definition = payload.get("taskDefinition")
+        containers = task_definition.get("containerDefinitions")
+        if not isinstance(containers, list):
+            raise TypeError
+        onboarding = [
+            container
+            for container in containers
+            if isinstance(container, dict)
+            and container.get("name") == ONBOARDING_CONTAINER_NAME
+        ]
+        if len(onboarding) != 1:
+            raise TypeError
+        environment = onboarding[0].get("environment") or []
+        if not isinstance(environment, list) or any(
+            not isinstance(item, dict)
+            or not isinstance(item.get("name"), str)
+            or not isinstance(item.get("value"), str)
+            for item in environment
+        ):
+            raise TypeError
+    except (AttributeError, TypeError, json.JSONDecodeError) as exc:
+        raise SelfHostError("ECS returned an invalid onboarding task definition") from exc
+    values = {
+        item["name"]: item["value"]
+        for item in environment
+        if item["name"] in PRESERVED_ONBOARDING_ENVIRONMENT
+    }
+    if sum(
+        item["name"] in PRESERVED_ONBOARDING_ENVIRONMENT for item in environment
+    ) != len(values):
+        raise SelfHostError("onboarding task has duplicate managed environment values")
+    return values
+
+
 def _verify_health(public_url: str, *, attempts: int = 20, delay: float = 6.0) -> bool:
     context = ssl.create_default_context()
     url = f"{public_url}/healthz"
@@ -656,20 +882,27 @@ def deploy(args: argparse.Namespace) -> int:
     runner.run(("npm", "run", "build"), cwd=ROOT / "infra/data")
     _cdk_deploy(runner, (data_stack, observability_stack), config)
 
+    existing_runtime_environment = _existing_runtime_environment(runner, config)
+    runtime_environment = {
+        name: _preserved_environment_value(name, existing_runtime_environment)
+        for name in PRESERVED_RUNTIME_ENVIRONMENT
+    }
+    existing_onboarding_environment = _existing_onboarding_environment(runner, config)
+    onboarding_environment = {
+        name: _preserved_environment_value(name, existing_onboarding_environment)
+        for name in PRESERVED_ONBOARDING_ENVIRONMENT
+    }
     with _pinned_agentcore_cli() as cli_directory:
         runtime_runner = CommandRunner(
             config.aws_env
             | {
                 "PATH": f"{cli_directory}{os.pathsep}{os.environ.get('PATH', '')}",
                 "DOMAIN_NAME": config.domain,
-                "GITHUB_APP_ID": "",
-                "AGENTCORE_MEMORY_ID": "",
-                "AGENTCORE_SEMANTIC_STRATEGY_ID": "",
-                "AGENTCORE_USER_PREF_STRATEGY_ID": "",
                 "DEPLOY_EXPERIMENTAL_SANDBOX": "false",
             }
+            | runtime_environment
         )
-        runtime_runner.run(("bash", "scripts/deploy_agent.sh"))
+        runtime_runner.run(("bash", "scripts/deploy_agent.sh", "--yes"))
 
     runtime_result = runner.run(
         ("bash", "scripts/resolve_agent_runtime.sh"), capture=True
@@ -679,16 +912,52 @@ def deploy(args: argparse.Namespace) -> int:
         raise SelfHostError("AgentCore runtime resolver did not return an ARN")
     runner.run(("bash", "infra/data/scripts/attach_agent_policy.sh"))
 
-    _cdk_deploy(
-        runner,
-        (services_stack,),
-        config,
+    service_contexts = [
         ("agentRuntimeArn", runtime_arn),
         ("certificateArn", config.certificate_arn),
         ("domainName", config.domain),
         ("slackSecretsArn", slack_secret.arn),
         ("bridgeSecretsArn", bridge_secret.arn),
-    )
+    ]
+    if runtime_environment["GITHUB_APP_ID"]:
+        service_contexts.append(
+            ("githubAppId", runtime_environment["GITHUB_APP_ID"])
+        )
+    if onboarding_environment["GITHUB_APP_SLUG"]:
+        service_contexts.append(
+            ("githubAppSlug", onboarding_environment["GITHUB_APP_SLUG"])
+        )
+    _cdk_deploy(runner, (services_stack,), config, *service_contexts)
+
+    outputs = _stack_outputs(runner, config, services_stack)
+    alb_dns = outputs.get("AlbDnsName")
+    if not alb_dns:
+        raise SelfHostError("services stack did not return AlbDnsName")
+    state_path = _write_state(config, outputs)
+
+    print("\nCore AWS services deployed.")
+    print(f"  DNS:      create an ALIAS/CNAME from {config.domain} to {alb_dns}")
+    print(f"  Manifest: {manifest}")
+    print(f"  State:    {state_path}")
+    print(f"  Install:  {config.public_url}/slack/install")
+
+    if args.skip_health_check:
+        print("\nHealth verification and Gateway deployment deferred.")
+        print("After DNS is live, rerun without --skip-health-check.")
+        print("You can verify DNS/HTTPS first with:")
+        print(f"  curl --fail {config.public_url}/healthz")
+        return 0
+
+    if not args.yes:
+        input(
+            "\nCreate the DNS record above, wait for it to resolve, then press Enter: "
+        )
+    print(f"Verifying {config.public_url}/healthz ...", flush=True)
+    if not _verify_health(config.public_url):
+        raise SelfHostError(
+            "core services deployed but HTTPS health verification failed; Gateway was "
+            "not deployed; check DNS, ACM, the ALB target groups, and ECS service events"
+        )
 
     runner.run(("bash", "scripts/build_interceptor_zip.sh"), cwd=ROOT / "infra/data")
     _cdk_deploy(
@@ -707,33 +976,7 @@ def deploy(args: argparse.Namespace) -> int:
         cwd=ROOT / "infra/data",
     )
 
-    outputs = _stack_outputs(runner, config, services_stack)
-    alb_dns = outputs.get("AlbDnsName")
-    if not alb_dns:
-        raise SelfHostError("services stack did not return AlbDnsName")
-    state_path = _write_state(config, outputs)
-
     print("\nAWS deployment completed.")
-    print(f"  DNS:      create an ALIAS/CNAME from {config.domain} to {alb_dns}")
-    print(f"  Manifest: {manifest}")
-    print(f"  State:    {state_path}")
-    print(f"  Install:  {config.public_url}/slack/install")
-
-    if args.skip_health_check:
-        print("\nHealth verification skipped. Run:")
-        print(f"  curl --fail {config.public_url}/healthz")
-        return 0
-
-    if not args.yes:
-        input(
-            "\nCreate the DNS record above, wait for it to resolve, then press Enter: "
-        )
-    print(f"Verifying {config.public_url}/healthz ...", flush=True)
-    if not _verify_health(config.public_url):
-        raise SelfHostError(
-            "deployment finished but HTTPS health verification failed; check DNS, ACM, "
-            "the ALB target groups, and ECS service events"
-        )
     print("\nAgent is healthy. Open the install URL and add it to a Slack workspace.")
     return 0
 
@@ -753,8 +996,9 @@ def _dry_run(args: argparse.Namespace) -> int:
     print("4. Deploy data tables and CloudWatch alarms")
     print("5. Validate and deploy the AgentCore runtime, then attach data IAM")
     print("6. Build and deploy the bridge/onboarding ECS services behind HTTPS")
-    print("7. Deploy and provision the shared tenant-scoped AgentCore Gateway")
-    print("8. Print the DNS target, verify /healthz, and open Slack installation")
+    print("7. Print the DNS target and verify HTTPS /healthz")
+    print("8. Deploy and provision the shared tenant-scoped AgentCore Gateway")
+    print("9. Open Slack installation")
     print("\nExperimental PR sandbox: disabled")
     print("AgentCore Memory: optional, not part of first-run deployment")
     return 0
@@ -784,7 +1028,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--skip-health-check",
         action="store_true",
-        help="finish after deployment without waiting for DNS/HTTPS",
+        help="stop after core services and defer Gateway until DNS/HTTPS is ready",
     )
     parser.add_argument(
         "--force-target",

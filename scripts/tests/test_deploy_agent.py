@@ -23,6 +23,7 @@ CONTROLLED_ENV = (
     "AGENTCORE_SEMANTIC_STRATEGY_ID",
     "AGENTCORE_USER_PREF_STRATEGY_ID",
     "DEPLOY_EXPERIMENTAL_SANDBOX",
+    "INIT_CWD",
 )
 
 
@@ -99,6 +100,7 @@ class DeployAgentTests(unittest.TestCase):
                 command_name="${1:-missing}"
                 printf '%s\n' "$*" >> "$FAKE_CALL_LOG"
                 cp "$FAKE_MANIFEST" "$FAKE_CAPTURE_DIR/${command_name}.json"
+                printf '%s\n' "${INIT_CWD:-}" > "$FAKE_CAPTURE_DIR/${command_name}.init_cwd"
                 case "$command_name" in
                   validate) exit "${FAKE_VALIDATE_EXIT:-0}" ;;
                   deploy) exit "${FAKE_DEPLOY_EXIT:-0}" ;;
@@ -212,6 +214,24 @@ class DeployAgentTests(unittest.TestCase):
                 1,
             )
             self.assert_original_restored(paths, original, original_mode)
+
+    def test_hostile_init_cwd_is_overridden_for_validate_and_deploy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = self.make_repo(root)
+
+            result = self.run_wrapper(
+                paths,
+                extra_env={"INIT_CWD": str(root / "wrong-project")},
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            expected = str(root / "coreAgent")
+            for command_name in ("validate", "deploy"):
+                captured = (paths["captures"] / f"{command_name}.init_cwd").read_text(
+                    encoding="utf-8"
+                )
+                self.assertEqual(captured.strip(), expected)
 
     def test_validate_failure_is_propagated_without_deploy_and_restores(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

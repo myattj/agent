@@ -22,6 +22,7 @@ import time
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
 
+from .access_log import install_uvicorn_access_log_redaction
 from .adapters.debug import DebugAdapter
 from .adapters.slack import SlackAdapter, SlackSignatureError
 from .api import api_router
@@ -50,6 +51,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(levelname)s:%(name)s: %(message)s",
 )
+install_uvicorn_access_log_redaction()
 
 log = logging.getLogger(__name__)
 

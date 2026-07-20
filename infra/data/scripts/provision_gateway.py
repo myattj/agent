@@ -10,17 +10,18 @@ What it creates:
   1. A single Gateway with protocolType=MCP, authorizerType=CUSTOM_JWT,
      pointing the JWT discoveryUrl at the bridge's
      /.well-known/openid-configuration route.
-  2. The interceptor Lambda is wired in as a REQUEST interceptor at
-     `BEFORE_TARGET` with `passRequestHeaders=true` (the interceptor
+  2. The interceptor Lambda is wired in at the REQUEST interception point
+     with `passRequestHeaders=true` (the interceptor
      needs the Authorization header to verify the JWT).
   3. The resulting Gateway ID + URL + ARN are written to SSM Parameter
      Store under /agentcore/gateway/{id,url,arn} so the bridge's
      per-tenant target provisioner can find them.
 
 Idempotent: re-running the script when a Gateway already exists at the
-same name updates the SSM params and re-reads the existing Gateway
-state, rather than creating a duplicate. To force a clean re-create,
-run delete_gateway.py first.
+same name waits for a ready state, validates its security-sensitive
+configuration, and updates the SSM params rather than creating a duplicate.
+Configuration drift fails closed. To force a clean re-create, run
+delete_gateway.py first.
 
 Usage:
   cd infra/data
@@ -189,8 +190,74 @@ def create_gateway(
     return client.create_gateway(**request)
 
 
+def gateway_configuration_differences(
+    gateway: dict[str, Any], outputs: dict[str, str]
+) -> list[str]:
+    """Return security-sensitive differences from the supported topology."""
+    differences: list[str] = []
+    expected_scalars = {
+        "roleArn": outputs["GatewayRoleArn"],
+        "protocolType": "MCP",
+        "authorizerType": "CUSTOM_JWT",
+    }
+    for key, expected in expected_scalars.items():
+        if gateway.get(key) != expected:
+            differences.append(f"{key} does not match the deployed GatewayStack")
+
+    authorizer = gateway.get("authorizerConfiguration")
+    custom_jwt = (
+        authorizer.get("customJWTAuthorizer")
+        if isinstance(authorizer, dict)
+        else None
+    )
+    if not isinstance(custom_jwt, dict):
+        differences.append("CUSTOM_JWT authorizer configuration is missing")
+    else:
+        if custom_jwt.get("discoveryUrl") != outputs["BridgeOidcDiscoveryUrl"]:
+            differences.append("JWT discoveryUrl does not match the bridge")
+        audiences = custom_jwt.get("allowedAudience")
+        if audiences != ["agentcore-gateway"]:
+            differences.append("JWT allowedAudience is not exactly agentcore-gateway")
+
+    interceptors = gateway.get("interceptorConfigurations")
+    if not isinstance(interceptors, list) or len(interceptors) != 1:
+        differences.append("expected exactly one Gateway interceptor")
+    else:
+        interceptor = interceptors[0]
+        if not isinstance(interceptor, dict):
+            differences.append("Gateway interceptor configuration is invalid")
+        else:
+            lambda_config = interceptor.get("interceptor")
+            lambda_config = (
+                lambda_config.get("lambda")
+                if isinstance(lambda_config, dict)
+                else None
+            )
+            if (
+                not isinstance(lambda_config, dict)
+                or lambda_config.get("arn") != outputs["InterceptorLambdaArn"]
+            ):
+                differences.append(
+                    "interceptor Lambda ARN does not match the deployed GatewayStack"
+                )
+            if interceptor.get("interceptionPoints") != ["REQUEST"]:
+                differences.append("interceptionPoints is not exactly REQUEST")
+            input_configuration = interceptor.get("inputConfiguration")
+            if (
+                not isinstance(input_configuration, dict)
+                or input_configuration.get("passRequestHeaders") is not True
+            ):
+                differences.append("interceptor does not pass request headers")
+
+    if not gateway.get("gatewayUrl"):
+        differences.append("gatewayUrl is missing")
+    if not gateway.get("gatewayArn"):
+        differences.append("gatewayArn is missing")
+    return differences
+
+
 def wait_for_gateway_ready(client: Any, gateway_id: str, timeout: int = 120) -> dict[str, Any]:
-    """Poll the gateway until it's no longer in CREATING state.
+    """Poll a creating or updating gateway until it is ready.
 
     AgentCore Gateway provisioning is documented as fast (sub-minute) but
     we give it 2 min for headroom. Returns the final gateway dict.
@@ -201,7 +268,7 @@ def wait_for_gateway_ready(client: Any, gateway_id: str, timeout: int = 120) -> 
         status = gw.get("status", "")
         if status in ("READY", "ACTIVE"):
             return gw
-        if status in ("FAILED", "DELETING", "DELETED"):
+        if status in ("FAILED", "UPDATE_UNSUCCESSFUL", "DELETING", "DELETED"):
             fail(f"gateway entered terminal state {status}: {gw.get('statusReasons')}")
             raise SystemExit(1)
         time.sleep(3)
@@ -282,6 +349,21 @@ def main(argv: list[str] | None = None) -> int:
         warn(f"gateway already exists: id={gateway_id} status={existing.get('status')}")
         # list_gateways may not include gatewayUrl/gatewayArn — fetch full details.
         full = client.get_gateway(gatewayIdentifier=gateway_id)
+        if full.get("status") not in ("READY", "ACTIVE"):
+            step("waiting for existing gateway to be ready")
+            full = wait_for_gateway_ready(client, gateway_id)
+        differences = gateway_configuration_differences(full, outputs)
+        if differences:
+            fail("existing gateway does not match the supported configuration:")
+            for difference in differences:
+                print(f"    - {difference}")
+            print(
+                "  Recreate it with delete_gateway.py, then rerun this command."
+            )
+            return 1
+        if args.dry_run:
+            step("dry-run: existing gateway is valid; would re-publish SSM coordinates")
+            return 0
         warn("re-publishing existing coordinates to SSM (idempotent path)")
         publish_to_ssm(
             args.region,

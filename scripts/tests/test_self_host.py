@@ -7,7 +7,7 @@ import stat
 import subprocess
 import tempfile
 import unittest
-from contextlib import nullcontext, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -227,16 +227,209 @@ class SecretTests(unittest.TestCase):
             self.assertEqual(self_host.collect_slack_payload(existing), payload)
 
 
-class DeploymentPlanTests(unittest.TestCase):
-    def test_pinned_agentcore_cli_is_private_and_temporary(self) -> None:
-        with self_host._pinned_agentcore_cli() as directory:
-            executable = directory / "agentcore"
-            self.assertTrue(executable.exists())
-            self.assertEqual(stat.S_IMODE(executable.stat().st_mode), 0o700)
-            self.assertIn("@aws/agentcore@0.24.1", executable.read_text())
-        self.assertFalse(directory.exists())
+class RuntimeEnvironmentTests(unittest.TestCase):
+    def test_existing_runtime_environment_reads_only_managed_optional_values(self) -> None:
+        runner = mock.Mock()
+        runner.run.side_effect = [
+            completed(
+                ["aws", "list-agent-runtimes"],
+                json.dumps(
+                    {
+                        "agentRuntimes": [
+                            {
+                                "agentRuntimeName": "coreAgent_coreAgent",
+                                "agentRuntimeId": "coreAgent_coreAgent-abcdefghij",
+                                "agentRuntimeVersion": "7",
+                            }
+                        ]
+                    }
+                ),
+            ),
+            completed(
+                ["aws", "get-agent-runtime"],
+                json.dumps(
+                    {
+                        "agentRuntimeName": "coreAgent_coreAgent",
+                        "agentRuntimeId": "coreAgent_coreAgent-abcdefghij",
+                        "agentRuntimeVersion": "7",
+                        "environmentVariables": {
+                            "AWS_REGION": "us-west-2",
+                            "GITHUB_APP_ID": "3350219",
+                            "AGENTCORE_MEMORY_ID": "memory-1",
+                            "UNMANAGED_VALUE": "do-not-copy",
+                        },
+                    }
+                ),
+            ),
+        ]
 
-    def test_guided_deploy_reuses_existing_interfaces_in_dependency_order(self) -> None:
+        result = self_host._existing_runtime_environment(runner, config())
+
+        self.assertEqual(
+            result,
+            {
+                "GITHUB_APP_ID": "3350219",
+                "AGENTCORE_MEMORY_ID": "memory-1",
+            },
+        )
+        get_command = list(runner.run.call_args_list[1].args[0])
+        self.assertIn("--agent-runtime-id", get_command)
+        self.assertIn("coreAgent_coreAgent-abcdefghij", get_command)
+        self.assertIn("--agent-runtime-version", get_command)
+        self.assertIn("7", get_command)
+
+    def test_existing_runtime_environment_allows_first_install(self) -> None:
+        runner = mock.Mock()
+        runner.run.return_value = completed(
+            ["aws", "list-agent-runtimes"], json.dumps({"agentRuntimes": []})
+        )
+
+        self.assertEqual(
+            self_host._existing_runtime_environment(runner, config()), {}
+        )
+        self.assertEqual(runner.run.call_count, 1)
+
+    def test_existing_runtime_environment_rejects_ambiguous_runtime(self) -> None:
+        runtime = {
+            "agentRuntimeName": "coreAgent_coreAgent",
+            "agentRuntimeId": "coreAgent_coreAgent-abcdefghij",
+            "agentRuntimeVersion": "7",
+        }
+        runner = mock.Mock()
+        runner.run.return_value = completed(
+            ["aws", "list-agent-runtimes"],
+            json.dumps({"agentRuntimes": [runtime, runtime]}),
+        )
+
+        with self.assertRaisesRegex(self_host.SelfHostError, "found 2"):
+            self_host._existing_runtime_environment(runner, config())
+
+
+class OnboardingEnvironmentTests(unittest.TestCase):
+    def test_existing_onboarding_environment_reads_only_github_slug(self) -> None:
+        cluster_arn = "arn:aws:ecs:us-west-2:123456789012:cluster/agentcore-services"
+        task_arn = "arn:aws:ecs:us-west-2:123456789012:task-definition/onboarding:14"
+        runner = mock.Mock()
+        runner.run.side_effect = [
+            completed(
+                ["aws", "ecs", "list-clusters"],
+                json.dumps({"clusterArns": [cluster_arn]}),
+            ),
+            completed(
+                ["aws", "ecs", "describe-services"],
+                json.dumps(
+                    {
+                        "services": [
+                            {
+                                "serviceName": "agentcore-onboarding",
+                                "taskDefinition": task_arn,
+                            }
+                        ],
+                        "failures": [],
+                    }
+                ),
+            ),
+            completed(
+                ["aws", "ecs", "describe-task-definition"],
+                json.dumps(
+                    {
+                        "taskDefinition": {
+                            "containerDefinitions": [
+                                {
+                                    "name": "onboarding",
+                                    "environment": [
+                                        {
+                                            "name": "GITHUB_APP_SLUG",
+                                            "value": "slinck-ai",
+                                        },
+                                        {"name": "NODE_ENV", "value": "production"},
+                                    ],
+                                }
+                            ]
+                        }
+                    }
+                ),
+            ),
+        ]
+
+        result = self_host._existing_onboarding_environment(runner, config())
+
+        self.assertEqual(result, {"GITHUB_APP_SLUG": "slinck-ai"})
+        service_command = list(runner.run.call_args_list[1].args[0])
+        self.assertIn(cluster_arn, service_command)
+        self.assertIn("agentcore-onboarding", service_command)
+        task_command = list(runner.run.call_args_list[2].args[0])
+        self.assertIn(task_arn, task_command)
+
+    def test_existing_onboarding_environment_allows_first_install(self) -> None:
+        runner = mock.Mock()
+        runner.run.return_value = completed(
+            ["aws", "ecs", "list-clusters"], json.dumps({"clusterArns": []})
+        )
+
+        self.assertEqual(
+            self_host._existing_onboarding_environment(runner, config()), {}
+        )
+        self.assertEqual(runner.run.call_count, 1)
+
+    def test_existing_onboarding_environment_rejects_duplicate_slug(self) -> None:
+        runner = mock.Mock()
+        runner.run.side_effect = [
+            completed(
+                ["aws", "ecs", "list-clusters"],
+                json.dumps(
+                    {
+                        "clusterArns": [
+                            "arn:aws:ecs:us-west-2:123456789012:"
+                            "cluster/agentcore-services"
+                        ]
+                    }
+                ),
+            ),
+            completed(
+                ["aws", "ecs", "describe-services"],
+                json.dumps(
+                    {
+                        "services": [{"taskDefinition": "task:14"}],
+                        "failures": [],
+                    }
+                ),
+            ),
+            completed(
+                ["aws", "ecs", "describe-task-definition"],
+                json.dumps(
+                    {
+                        "taskDefinition": {
+                            "containerDefinitions": [
+                                {
+                                    "name": "onboarding",
+                                    "environment": [
+                                        {"name": "GITHUB_APP_SLUG", "value": "one"},
+                                        {"name": "GITHUB_APP_SLUG", "value": "two"},
+                                    ],
+                                }
+                            ]
+                        }
+                    }
+                ),
+            ),
+        ]
+
+        with self.assertRaisesRegex(self_host.SelfHostError, "duplicate"):
+            self_host._existing_onboarding_environment(runner, config())
+
+
+class DeploymentPlanTests(unittest.TestCase):
+    @contextmanager
+    def _guided_deploy(
+        self,
+        *,
+        health_result: bool = True,
+        skip_health_check: bool = False,
+        existing_runtime_environment: dict[str, str] | None = None,
+        existing_onboarding_environment: dict[str, str] | None = None,
+        operator_environment: dict[str, str] | None = None,
+    ):
         target = self_host.configure_aws.AwsTarget(
             account="123456789012",
             region="us-west-2",
@@ -271,23 +464,26 @@ class DeploymentPlanTests(unittest.TestCase):
             return completed(list(command))
 
         runner.run.side_effect = run
-        args = self_host.build_parser().parse_args(
-            [
-                "--profile",
-                "sandbox",
-                "--region",
-                "us-west-2",
-                "--domain",
-                "agent.example.com",
-                "--certificate-arn",
-                config().certificate_arn,
-                "--skip-setup",
-                "--yes",
-                "--skip-health-check",
-            ]
-        )
+        arguments = [
+            "--profile",
+            "sandbox",
+            "--region",
+            "us-west-2",
+            "--domain",
+            "agent.example.com",
+            "--certificate-arn",
+            config().certificate_arn,
+            "--skip-setup",
+            "--yes",
+        ]
+        if skip_health_check:
+            arguments.append("--skip-health-check")
+        args = self_host.build_parser().parse_args(arguments)
 
         with (
+            mock.patch.dict(
+                os.environ, operator_environment or {}, clear=True
+            ),
             mock.patch.object(self_host, "_require_tools"),
             mock.patch.object(
                 self_host.configure_aws,
@@ -323,6 +519,16 @@ class DeploymentPlanTests(unittest.TestCase):
                 "_pinned_agentcore_cli",
                 return_value=nullcontext(Path("/tmp/pinned-agentcore")),
             ),
+            mock.patch.object(
+                self_host,
+                "_existing_runtime_environment",
+                return_value=existing_runtime_environment or {},
+            ),
+            mock.patch.object(
+                self_host,
+                "_existing_onboarding_environment",
+                return_value=existing_onboarding_environment or {},
+            ),
             mock.patch.object(self_host, "_cdk_deploy") as cdk_deploy,
             mock.patch.object(
                 self_host,
@@ -332,10 +538,46 @@ class DeploymentPlanTests(unittest.TestCase):
             mock.patch.object(
                 self_host, "_write_state", return_value=Path("deployment.json")
             ),
+            mock.patch.object(
+                self_host, "_verify_health", return_value=health_result
+            ) as verify_health,
         ):
-            result = self_host.deploy(args)
+            call_order = mock.Mock()
+            call_order.attach_mock(cdk_deploy, "cdk_deploy")
+            call_order.attach_mock(verify_health, "verify_health")
+            call_order.attach_mock(runner.run, "run")
+            yield {
+                "args": args,
+                "runner": runner,
+                "runner_factory": runner_factory,
+                "cdk_deploy": cdk_deploy,
+                "verify_health": verify_health,
+                "call_order": call_order,
+            }
+
+    def test_pinned_agentcore_cli_is_private_and_temporary(self) -> None:
+        with self_host._pinned_agentcore_cli() as directory:
+            executable = directory / "agentcore"
+            self.assertTrue(executable.exists())
+            self.assertEqual(stat.S_IMODE(executable.stat().st_mode), 0o700)
+            self.assertIn("@aws/agentcore@0.24.1", executable.read_text())
+        self.assertFalse(directory.exists())
+
+    def test_guided_deploy_reuses_existing_interfaces_in_dependency_order(self) -> None:
+        optional_environment = {
+            "GITHUB_APP_ID": "3350219",
+            "AGENTCORE_MEMORY_ID": "memory-existing",
+            "AGENTCORE_SEMANTIC_STRATEGY_ID": "semantic-existing",
+            "AGENTCORE_USER_PREF_STRATEGY_ID": "preferences-existing",
+        }
+        with self._guided_deploy(
+            existing_runtime_environment=optional_environment,
+            existing_onboarding_environment={"GITHUB_APP_SLUG": "slinck-ai"},
+        ) as plan:
+            result = self_host.deploy(plan["args"])
 
         self.assertEqual(result, 0)
+        cdk_deploy = plan["cdk_deploy"]
         deployed_stacks = [call.args[1] for call in cdk_deploy.call_args_list]
         self.assertEqual(
             deployed_stacks,
@@ -348,18 +590,103 @@ class DeploymentPlanTests(unittest.TestCase):
                 ("AgentCore-coreAgent-gateway-us-west-2",),
             ],
         )
+        runner = plan["runner"]
         all_commands = [list(call.args[0]) for call in runner.run.call_args_list]
-        self.assertIn(["bash", "scripts/deploy_agent.sh"], all_commands)
+        self.assertIn(["bash", "scripts/deploy_agent.sh", "--yes"], all_commands)
+        self.assertNotIn(["bash", "scripts/deploy_agent.sh"], all_commands)
+        runner_factory = plan["runner_factory"]
         runtime_environment = runner_factory.call_args_list[1].args[0]
         self.assertEqual(runtime_environment["DOMAIN_NAME"], "agent.example.com")
         self.assertEqual(runtime_environment["DEPLOY_EXPERIMENTAL_SANDBOX"], "false")
+        for name, value in optional_environment.items():
+            self.assertEqual(runtime_environment[name], value)
         self.assertTrue(runtime_environment["PATH"].startswith("/tmp/pinned-agentcore"))
+        services_call = cdk_deploy.call_args_list[1]
+        self.assertIn(("githubAppId", "3350219"), services_call.args[3:])
+        self.assertIn(("githubAppSlug", "slinck-ai"), services_call.args[3:])
         self.assertTrue(
             any("provision_gateway.py" in " ".join(command) for command in all_commands)
         )
+        health_index = next(
+            index
+            for index, call in enumerate(plan["call_order"].mock_calls)
+            if call[0] == "verify_health"
+        )
+        gateway_deploy_index = next(
+            index
+            for index, call in enumerate(plan["call_order"].mock_calls)
+            if call[0] == "cdk_deploy"
+            and call.args[1] == ("AgentCore-coreAgent-gateway-us-west-2",)
+        )
+        gateway_provision_index = next(
+            index
+            for index, call in enumerate(plan["call_order"].mock_calls)
+            if call[0] == "run" and "provision_gateway.py" in " ".join(call.args[0])
+        )
+        self.assertLess(health_index, gateway_deploy_index)
+        self.assertLess(gateway_deploy_index, gateway_provision_index)
         self.assertFalse(
             any("sandbox" in " ".join(command).lower() for command in all_commands)
         )
+
+    def test_explicit_runtime_environment_overrides_preserved_value(self) -> None:
+        with self._guided_deploy(
+            skip_health_check=True,
+            existing_runtime_environment={
+                "GITHUB_APP_ID": "3350219",
+                "AGENTCORE_MEMORY_ID": "memory-existing",
+            },
+            existing_onboarding_environment={"GITHUB_APP_SLUG": "slinck-ai"},
+            operator_environment={
+                "GITHUB_APP_ID": "",
+                "AGENTCORE_MEMORY_ID": "memory-replacement",
+                "GITHUB_APP_SLUG": "replacement-app",
+            },
+        ) as plan:
+            self_host.deploy(plan["args"])
+
+        runtime_environment = plan["runner_factory"].call_args_list[1].args[0]
+        self.assertEqual(runtime_environment["GITHUB_APP_ID"], "")
+        self.assertEqual(
+            runtime_environment["AGENTCORE_MEMORY_ID"], "memory-replacement"
+        )
+        services_call = plan["cdk_deploy"].call_args_list[1]
+        self.assertNotIn(("githubAppId", "3350219"), services_call.args[3:])
+        self.assertNotIn(("githubAppSlug", "slinck-ai"), services_call.args[3:])
+        self.assertIn(("githubAppSlug", "replacement-app"), services_call.args[3:])
+
+    def test_health_failure_does_not_deploy_or_provision_gateway(self) -> None:
+        with self._guided_deploy(health_result=False) as plan:
+            with self.assertRaises(self_host.SelfHostError):
+                self_host.deploy(plan["args"])
+
+        deployed_stacks = [call.args[1] for call in plan["cdk_deploy"].call_args_list]
+        self.assertNotIn(("AgentCore-coreAgent-gateway-us-west-2",), deployed_stacks)
+        all_commands = [
+            list(call.args[0]) for call in plan["runner"].run.call_args_list
+        ]
+        self.assertFalse(
+            any("provision_gateway.py" in " ".join(command) for command in all_commands)
+        )
+
+    def test_skip_health_check_defers_gateway_until_rerun(self) -> None:
+        output = io.StringIO()
+        with self._guided_deploy(skip_health_check=True) as plan:
+            with redirect_stdout(output):
+                result = self_host.deploy(plan["args"])
+
+        self.assertEqual(result, 0)
+        plan["verify_health"].assert_not_called()
+        deployed_stacks = [call.args[1] for call in plan["cdk_deploy"].call_args_list]
+        self.assertNotIn(("AgentCore-coreAgent-gateway-us-west-2",), deployed_stacks)
+        all_commands = [
+            list(call.args[0]) for call in plan["runner"].run.call_args_list
+        ]
+        self.assertFalse(
+            any("provision_gateway.py" in " ".join(command) for command in all_commands)
+        )
+        self.assertIn("Gateway deployment deferred", output.getvalue())
+        self.assertIn("rerun without --skip-health-check", output.getvalue())
 
     def test_cdk_deploy_is_explicit_and_never_includes_sandbox(self) -> None:
         runner = mock.Mock()

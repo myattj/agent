@@ -214,10 +214,10 @@ class EMFMetricsEmitter:
 
         ``dimensions`` is a list of dimension-sets. Each set is a list of
         field names whose values (looked up in ``values``) form one unique
-        dimension combination. EMF allows multiple sets per record so one
-        line can produce per-tenant AND per-(tenant, model) metrics without
-        two separate emissions, but we keep it to a single set per record
-        for simplicity and to match how the CDK dashboard queries them.
+        dimension combination. An empty set publishes a zero-dimension
+        platform aggregate. EMF allows multiple sets per record so one line
+        can produce both platform-wide and per-tenant metrics without a
+        second emission.
 
         ``metrics`` is ``[{"Name": "Invocations", "Unit": "Count"}, ...]`` —
         the set of metric values to publish from this record. Names must
@@ -262,12 +262,14 @@ class EMFMetricsEmitter:
         try:
             cost_cents = compute_cost_cents(model_id, input_tokens, output_tokens)
 
-            # Record 1 — per-tenant only (Invocations, Errors, Duration).
-            # Kept as its own record so tenant-level dashboards don't fan
-            # out into N_tenants x N_models metric series.
+            # Record 1 — platform aggregate + per-tenant metrics
+            # (Invocations, Errors, Duration). CloudWatch custom metrics do
+            # not automatically roll dimensioned series up into an
+            # un-dimensioned series, so the empty dimension set is required
+            # by the platform dashboard and canary alarms.
             errors_value = 0 if success else 1
             self._emit_emf(
-                dimensions=[["tenant_id"]],
+                dimensions=[[], ["tenant_id"]],
                 metrics=[
                     {"Name": "Invocations", "Unit": "Count"},
                     {"Name": "InvocationErrors", "Unit": "Count"},
