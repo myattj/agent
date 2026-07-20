@@ -82,7 +82,10 @@ class EMFEmitterInvocationTest(unittest.TestCase):
         # Record 1 — tenant-only dimension set.
         aws1 = r1["_aws"]
         self.assertEqual(aws1["CloudWatchMetrics"][0]["Namespace"], "Test/Agent")
-        self.assertEqual(aws1["CloudWatchMetrics"][0]["Dimensions"], [["tenant_id"]])
+        self.assertEqual(
+            aws1["CloudWatchMetrics"][0]["Dimensions"],
+            [[], ["tenant_id"]],
+        )
         names1 = [m["Name"] for m in aws1["CloudWatchMetrics"][0]["Metrics"]]
         self.assertEqual(
             sorted(names1),

@@ -805,6 +805,11 @@ async def invoke(payload, context):
             "model": load_model(config.model_id),
             "system_prompt": effective_prompt,
             "tools": tools,
+            # Responses are already streamed to the AgentCore caller below.
+            # Strands otherwise installs PrintingCallbackHandler and writes
+            # every model delta to stdout, leaking response content into
+            # CloudWatch and corrupting adjacent EMF log records.
+            "callback_handler": None,
         }
         if session_mgr is not None:
             agent_kwargs["session_manager"] = session_mgr

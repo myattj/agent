@@ -75,6 +75,90 @@ async def test_context_assembly_runs_off_the_agentcore_event_loop(
     assert delegated[0][1]["tenant_id"] == "tenant-a"
 
 
+@pytest.mark.asyncio
+async def test_streamed_response_is_accumulated_without_printing_to_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import context_assembler
+    import main
+
+    response_text = "PRIVATE_MODEL_RESPONSE_SENTINEL"
+    missing_handler = object()
+    agent_kwargs: dict[str, Any] = {}
+    audit_rows: list[dict[str, Any]] = []
+
+    class FakeAgent:
+        def __init__(self, **kwargs: Any) -> None:
+            agent_kwargs.update(kwargs)
+
+        async def stream_async(self, _message: str):
+            # Mirror the relevant Strands behavior: omitting callback_handler
+            # installs PrintingCallbackHandler, while explicit None is silent.
+            if agent_kwargs.get("callback_handler", missing_handler) is missing_handler:
+                print(response_text, end="")
+            yield {"data": response_text}
+            yield {"usage": {"inputTokens": 7, "outputTokens": 3}}
+
+    async def direct_to_thread(
+        function: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        return function(*args, **kwargs)
+
+    def assemble(**kwargs: Any) -> context_assembler.AssembledContext:
+        return context_assembler.AssembledContext(
+            enriched_message=kwargs["user_message"],
+            system_prompt=kwargs["effective_prompt"],
+        )
+
+    monkeypatch.setattr(
+        main,
+        "load_tenant_config",
+        lambda _tenant: TenantConfig(tenant_id="tenant-a"),
+    )
+    monkeypatch.setattr(context_assembler, "assemble_context", assemble)
+    monkeypatch.setattr(main.asyncio, "to_thread", direct_to_thread)
+    monkeypatch.setattr(main, "build_catalog_tools", lambda *_args: [])
+    monkeypatch.setattr(main, "build_byo_mcp_client", lambda *_args: None)
+    monkeypatch.setattr(main, "_build_memory_session_manager", lambda *_args: None)
+    monkeypatch.setattr(main, "load_model", lambda _model_id: object())
+    monkeypatch.setattr(main, "Agent", FakeAgent)
+    monkeypatch.setattr(
+        main,
+        "_audit",
+        SimpleNamespace(write=lambda row: audit_rows.append(row)),
+    )
+    monkeypatch.setattr(
+        main,
+        "_metrics",
+        SimpleNamespace(emit_invocation=lambda **_kwargs: None),
+    )
+    monkeypatch.setattr(
+        main,
+        "_spend",
+        SimpleNamespace(
+            check_budget=lambda *_args: (True, 0),
+            record_spend=lambda *_args: None,
+        ),
+    )
+
+    yielded = [
+        chunk
+        async for chunk in main.invoke(
+            {"tenant_id": "tenant-a", "prompt": "hello", "ctx": {}},
+            None,
+        )
+    ]
+
+    captured = capsys.readouterr()
+    assert agent_kwargs["callback_handler"] is None
+    assert yielded == [response_text]
+    assert audit_rows[-1]["output_summary"] == response_text
+    assert response_text not in captured.out
+
+
 def test_async_registration_rolls_back_local_and_sdk_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

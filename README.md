@@ -114,19 +114,35 @@ The command:
 4. writes <code>.self-host/slack_manifest.json</code> with the correct OAuth, event, and interaction URLs so you can import it at [api.slack.com/apps](https://api.slack.com/apps);
 5. reads the resulting Slack credentials without echoing secrets;
 6. shows the exact AWS account and region and requires a typed confirmation before creating billable resources;
-7. creates or safely reuses the Secrets Manager values, configures the runtime with the selected region and public dashboard origin, then deploys data, alarms, the AgentCore runtime, bridge, onboarding UI, and shared tenant-scoped Gateway; and
-8. prints the ALB DNS target, waits for your DNS record, verifies HTTPS <code>/healthz</code>, and prints the Slack install URL.
+7. creates or safely reuses the Secrets Manager values, configures the runtime with the selected region and public dashboard origin, then deploys data, alarms, the AgentCore runtime, bridge, and onboarding UI;
+8. prints the ALB DNS target and Slack install URL, waits for your DNS record, and verifies HTTPS <code>/healthz</code>; and
+9. only after the public bridge is healthy, deploys and provisions the shared tenant-scoped Gateway.
 
 Reruns are idempotent: existing secrets are reused unless replacement values are
-provided through the documented environment variables, and CDK/AgentCore update
-the existing installation. The experimental PR sandbox remains disabled.
+provided through the documented environment variables, CDK/AgentCore update the
+existing installation, managed optional GitHub/Memory runtime values and the
+onboarding GitHub App slug are preserved from the deployed runtime and services,
+and an existing Gateway is validated before its coordinates are republished.
+Explicitly setting one of <code>GITHUB_APP_ID</code>,
+<code>GITHUB_APP_SLUG</code>,
+<code>AGENTCORE_MEMORY_ID</code>, <code>AGENTCORE_SEMANTIC_STRATEGY_ID</code>, or
+<code>AGENTCORE_USER_PREF_STRATEGY_ID</code> overrides the preserved runtime
+or onboarding value; setting it to an empty value removes it. Gateway configuration drift
+fails closed with a recreate instruction instead of silently reusing an unsafe
+resource. The experimental PR sandbox remains disabled.
 
 For noninteractive secret injection, set <code>SLACK_CLIENT_ID</code>,
 <code>SLACK_CLIENT_SECRET</code>, <code>SLACK_SIGNING_SECRET</code>, and
 <code>SLACK_APP_ID</code> through your CI secret store or process environment.
-Do not put secret values directly into a shared shell history. Automation can
-add <code>--yes --skip-health-check</code>; verify <code>/healthz</code> after its
-DNS record is live.
+Do not put secret values directly into a shared shell history. For automation
+or any first pass where DNS is not live yet, add
+<code>--yes --skip-health-check</code>. That pass deliberately stops after the
+core services and does not deploy the Gateway. Create the printed DNS record,
+verify <code>/healthz</code>, then rerun the same command with <code>--yes</code>
+and without <code>--skip-health-check</code> to validate HTTPS and finish Gateway
+provisioning. The installer supplies the pinned AgentCore CLI's noninteractive
+flag and project directory internally; callers do not need to set
+<code>INIT_CWD</code> or invoke the CLI themselves.
 
 Preview the phases without contacting AWS or changing anything:
 

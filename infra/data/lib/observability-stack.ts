@@ -3,8 +3,9 @@
  *
  * Consumes metrics the agent emits via CloudWatch Embedded Metric Format
  * (see `coreAgent/app/coreAgent/metrics.py`). Metrics are auto-published
- * by CloudWatch Logs under the `Agent/Runtime` namespace with dimensions
- * `tenant_id`, `model_id`, and `tool_name`.
+ * by CloudWatch Logs under the `Agent/Runtime` namespace. Invocation metrics
+ * are emitted both without dimensions (platform totals) and with `tenant_id`;
+ * economics and tool metrics use `tenant_id`, `model_id`, and `tool_name`.
  *
  * Resources:
  *   - CloudWatch Dashboard with per-tenant and platform-wide widgets
@@ -99,7 +100,7 @@ export class ObservabilityStack extends Stack {
     // and any dimension change is a one-line edit.
     // --------------------------------------------------------------------
 
-    /** Total platform-wide invocations (no dimensions — rolls up across tenants). */
+    /** Total platform-wide invocations (explicit zero-dimension EMF series). */
     const totalInvocations = (stat: string = Stats.SUM) =>
       new Metric({
         namespace: METRIC_NAMESPACE,
